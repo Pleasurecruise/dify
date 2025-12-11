@@ -83,6 +83,7 @@ from core.workflow.runtime import VariablePool
 
 from . import llm_utils
 from .entities import (
+    LLMGenerationData,
     LLMNodeChatModelMessage,
     LLMNodeCompletionModelPromptTemplate,
     LLMNodeData,
@@ -240,10 +241,13 @@ class LLMNode(Node[LLMNodeData]):
                 tenant_id=self.tenant_id,
             )
 
+            # Variables for outputs
+            generation_data: LLMGenerationData | None = None
+            structured_output: LLMStructuredOutput | None = None
+
             # Check if tools are configured
             if self.tool_call_enabled:
                 # Use tool-enabled invocation (Agent V2 style)
-                # This generator handles all events including final events
                 generator = self._invoke_llm_with_tools(
                     model_instance=model_instance,
                     prompt_messages=prompt_messages,
@@ -253,10 +257,6 @@ class LLMNode(Node[LLMNodeData]):
                     node_inputs=node_inputs,
                     process_data=process_data,
                 )
-                # Forward all events and return early since _invoke_llm_with_tools
-                # already sends final event and StreamCompletedEvent
-                yield from generator
-                return
             else:
                 # Use traditional LLM invocation
                 generator = LLMNode.invoke_llm(
@@ -274,8 +274,7 @@ class LLMNode(Node[LLMNodeData]):
                     reasoning_format=self._node_data.reasoning_format,
                 )
 
-            structured_output: LLMStructuredOutput | None = None
-
+            # Unified generator processing
             for event in generator:
                 if isinstance(event, (StreamChunkEvent, ThoughtChunkEvent)):
                     yield event
@@ -307,6 +306,23 @@ class LLMNode(Node[LLMNodeData]):
                 elif isinstance(event, LLMStructuredOutput):
                     structured_output = event
 
+            # Try to capture return value from generator (for tool invocation)
+            # If generator finished via for loop (traditional LLM), this will get None
+            # If generator has return value (tool invocation), this will capture it
+            try:
+                next(generator)
+            except StopIteration as e:
+                if isinstance(e.value, LLMGenerationData):
+                    generation_data = e.value
+
+            # Extract variables from generation_data if available
+            if generation_data:
+                clean_text = generation_data.text
+                reasoning_content = ""
+                usage = generation_data.usage
+                finish_reason = generation_data.finish_reason
+
+            # Unified process_data building
             process_data = {
                 "model_mode": model_config.mode,
                 "prompts": PromptMessageUtil.prompt_messages_to_prompt_for_saving(
@@ -318,38 +334,56 @@ class LLMNode(Node[LLMNodeData]):
                 "model_name": model_config.model,
             }
 
+            # Unified outputs building
             outputs = {
                 "text": clean_text,
                 "reasoning_content": reasoning_content,
                 "usage": jsonable_encoder(usage),
                 "finish_reason": finish_reason,
-                "generation": {
+            }
+
+            # Build generation field
+            if generation_data:
+                # Use generation_data from tool invocation (supports multi-turn)
+                generation = {
+                    "content": generation_data.text,
+                    "reasoning_content": generation_data.reasoning_contents,  # [thought1, thought2, ...]
+                    "tool_calls": generation_data.tool_calls,
+                }
+                files_to_output = generation_data.files
+            else:
+                # Traditional LLM invocation
+                generation = {
                     "content": clean_text,
                     "reasoning_content": [reasoning_content] if reasoning_content else [],
                     "tool_calls": [],
-                },
-            }
+                }
+                files_to_output = self._file_outputs
+
+            outputs["generation"] = generation
+            if files_to_output:
+                outputs["files"] = ArrayFileSegment(value=files_to_output)
             if structured_output:
                 outputs["structured_output"] = structured_output.structured_output
-            if self._file_outputs:
-                outputs["files"] = ArrayFileSegment(value=self._file_outputs)
 
             # Send final chunk event to indicate streaming is complete
-            yield StreamChunkEvent(
-                selector=[self._node_id, "text"],
-                chunk="",
-                is_final=True,
-            )
-            yield StreamChunkEvent(
-                selector=[self._node_id, "generation", "content"],
-                chunk="",
-                is_final=True,
-            )
-            yield ThoughtChunkEvent(
-                selector=[self._node_id, "generation", "thought"],
-                chunk="",
-                is_final=True,
-            )
+            if not self.tool_call_enabled:
+                # For tool calls, final events are already sent in _process_tool_outputs
+                yield StreamChunkEvent(
+                    selector=[self._node_id, "text"],
+                    chunk="",
+                    is_final=True,
+                )
+                yield StreamChunkEvent(
+                    selector=[self._node_id, "generation", "content"],
+                    chunk="",
+                    is_final=True,
+                )
+                yield ThoughtChunkEvent(
+                    selector=[self._node_id, "generation", "thought"],
+                    chunk="",
+                    is_final=True,
+                )
 
             yield StreamCompletedEvent(
                 node_run_result=NodeRunResult(
@@ -1313,8 +1347,11 @@ class LLMNode(Node[LLMNodeData]):
         variable_pool: VariablePool,
         node_inputs: dict[str, Any],
         process_data: dict[str, Any],
-    ) -> Generator[NodeEventBase, None, None]:
-        """Invoke LLM with tools support (from Agent V2)."""
+    ) -> Generator[NodeEventBase, None, LLMGenerationData]:
+        """Invoke LLM with tools support (from Agent V2).
+
+        Returns LLMGenerationData with text, reasoning_contents, tool_calls, usage, finish_reason, files
+        """
         # Get model features to determine strategy
         model_features = self._get_model_features(model_instance)
 
@@ -1342,8 +1379,9 @@ class LLMNode(Node[LLMNodeData]):
             stream=True,
         )
 
-        # Process outputs
-        yield from self._process_tool_outputs(outputs, strategy, node_inputs, process_data)
+        # Process outputs and return generation result
+        result = yield from self._process_tool_outputs(outputs, strategy, node_inputs, process_data)
+        return result
 
     def _get_model_features(self, model_instance: ModelInstance) -> list[ModelFeature]:
         """Get model schema to determine features."""
@@ -1440,8 +1478,11 @@ class LLMNode(Node[LLMNodeData]):
         strategy: Any,
         node_inputs: dict[str, Any],
         process_data: dict[str, Any],
-    ) -> Generator[NodeEventBase, None, None]:
-        """Process strategy outputs and convert to node events."""
+    ) -> Generator[NodeEventBase, None, LLMGenerationData]:
+        """Process strategy outputs and convert to node events.
+
+        Returns LLMGenerationData with text, reasoning_contents, tool_calls, usage, finish_reason, files
+        """
         text = ""
         files: list[File] = []
         usage = LLMUsage.empty_usage()
@@ -1450,7 +1491,9 @@ class LLMNode(Node[LLMNodeData]):
         agent_result: AgentResult | None = None
 
         think_parser = llm_utils.ThinkTagStreamParser()
-        reasoning_chunks: list[str] = []
+        # Track reasoning per turn: each tool_call completion marks end of a turn
+        current_turn_reasoning: list[str] = []  # Buffer for current turn's thought chunks
+        reasoning_per_turn: list[str] = []  # Final list: one element per turn
 
         # Process each output from strategy
         try:
@@ -1532,6 +1575,11 @@ class LLMNode(Node[LLMNodeData]):
                             is_final=False,
                         )
 
+                        # End of current turn: save accumulated thought as one element
+                        if current_turn_reasoning:
+                            reasoning_per_turn.append("".join(current_turn_reasoning))
+                            current_turn_reasoning.clear()
+
                 elif isinstance(output, LLMResultChunk):
                     # Handle LLM result chunks - only process text content
                     message = output.delta.message
@@ -1549,7 +1597,7 @@ class LLMNode(Node[LLMNodeData]):
                                 continue
 
                             if kind == "thought":
-                                reasoning_chunks.append(segment)
+                                current_turn_reasoning.append(segment)
                                 yield ThoughtChunkEvent(
                                     selector=[self._node_id, "generation", "thought"],
                                     chunk=segment,
@@ -1594,7 +1642,7 @@ class LLMNode(Node[LLMNodeData]):
             if not segment:
                 continue
             if kind == "thought":
-                reasoning_chunks.append(segment)
+                current_turn_reasoning.append(segment)
                 yield ThoughtChunkEvent(
                     selector=[self._node_id, "generation", "thought"],
                     chunk=segment,
@@ -1612,6 +1660,10 @@ class LLMNode(Node[LLMNodeData]):
                     chunk=segment,
                     is_final=False,
                 )
+
+        # Save the last turn's thought if any
+        if current_turn_reasoning:
+            reasoning_per_turn.append("".join(current_turn_reasoning))
 
         # Send final events for all streams
         yield StreamChunkEvent(
@@ -1653,7 +1705,7 @@ class LLMNode(Node[LLMNodeData]):
             is_final=True,
         )
 
-        # Build generation field from agent_logs
+        # Build tool_calls from agent_logs (with results)
         tool_calls_for_generation = []
         for log in agent_logs:
             if log.label == "Tool Call":
@@ -1665,33 +1717,14 @@ class LLMNode(Node[LLMNodeData]):
                 }
                 tool_calls_for_generation.append(tool_call_data)
 
-        # Complete with results
-        yield StreamCompletedEvent(
-            node_run_result=NodeRunResult(
-                status=WorkflowNodeExecutionStatus.SUCCEEDED,
-                outputs={
-                    "text": text,
-                    "files": ArrayFileSegment(value=files),
-                    "usage": jsonable_encoder(usage),
-                    "finish_reason": finish_reason,
-                    "generation": {
-                        "reasoning_content": ["".join(reasoning_chunks)] if reasoning_chunks else [],
-                        "tool_calls": tool_calls_for_generation,
-                        "content": text,
-                    },
-                },
-                inputs={
-                    **node_inputs,
-                    "tools": [
-                        {"provider_id": tool.provider_name, "tool_name": tool.tool_name}
-                        for tool in self._node_data.tools
-                    ]
-                    if self._node_data.tools
-                    else [],
-                },
-                process_data=process_data,
-                llm_usage=usage,
-            )
+        # Return generation data for caller
+        return LLMGenerationData(
+            text=text,
+            reasoning_contents=reasoning_per_turn,  # Multi-turn: [thought1, thought2, ...]
+            tool_calls=tool_calls_for_generation,
+            usage=usage,
+            finish_reason=finish_reason,
+            files=files,
         )
 
     def _accumulate_usage(self, total_usage: LLMUsage, delta_usage: LLMUsage) -> None:
